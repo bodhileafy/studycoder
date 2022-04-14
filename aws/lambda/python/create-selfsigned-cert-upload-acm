@@ -1,0 +1,142 @@
+import boto3
+import json
+from OpenSSL import SSL
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from datetime import datetime, timedelta
+import ipaddress
+from botocore.config import Config
+
+def lambda_handler(event, context):
+    http_success = 200
+    http_badrequest = 400
+    code = http_success
+    message = ""
+    hostname = ""
+    ip_addresses = ""
+    if "hostname" in event:
+        hostname = event['hostname']
+        if "ip_addresses" in event:
+            ip_addresses = event['ip_addresses']
+    else:
+        code = http_badrequest
+    if code == http_success:
+        message = generate_selfsigned_cert(hostname, ip_addresses)
+    return {
+        'statusCode': code,
+        'body': json.dumps(message)
+    }
+
+def generate_selfsigned_cert(hostname, ip_addresses):
+    # Source - https://gist.github.com/bloodearnest/9017111a313777b9cce5
+    key = rsa.generate_private_key(public_exponent=65537,key_size=2048,backend=default_backend())
+    try:
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+        alt_names = [x509.DNSName(hostname)]
+        # allow addressing by IP, for when you don't have real DNS (common in most testing scenarios 
+        if ip_addresses:
+            for addr in ip_addresses:
+                # openssl wants DNSnames for ips...
+                alt_names.append(x509.DNSName(addr))
+                # ... whereas golang's crypto/tls is stricter, and needs IPAddresses
+                # note: older versions of cryptography do not understand ip_address objects
+                alt_names.append(x509.IPAddress(ipaddress.ip_address(addr)))        
+        san = x509.SubjectAlternativeName(alt_names)
+        basic_contraints = x509.BasicConstraints(ca=True, path_length=0)
+        now = datetime.utcnow()
+        cert = (x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(1000)
+            .not_valid_before(now)
+            .not_valid_after(now + timedelta(days=365))
+            .add_extension(basic_contraints, False)
+            .add_extension(san, False)
+            .sign(key, hashes.SHA256(), default_backend()))
+        cert_pem = cert.public_bytes(encoding=serialization.Encoding.PEM)
+        key_pem = key.private_bytes(encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption())
+        if not verify_hostname(hostname,""):
+            register_acm(hostname, key_pem, cert_pem)
+            return "Certificate Generated and Import Into ACM us-east-1."
+        else:
+            return "Certificate Exist and Not Yet Expired."
+    except Exception as e:
+        return "Oops!"+str(e.__class__)+"occurred."
+
+def register_acm(hostname, key_pem, cert_pem):
+    acm_config = Config(
+        region_name = 'us-east-1'
+    )
+    client = boto3.client('acm',config=acm_config)
+    response = client.import_certificate(
+        Certificate=cert_pem,
+        PrivateKey=key_pem,
+        Tags=[
+            {
+                'Key': 'environment',
+                'Value': 'dcp'
+            },
+            {
+                'Key': 'lambda',
+                'Value': 'self-signed'
+            },
+            {
+                'Key': 'aws-account',
+                'Value': '200493768822'
+            },
+            {
+                'Key': 'lambda-region',
+                'Value': 'ap-east-1'
+            },
+            {
+                'Key': 'hostname',
+                'Value': hostname
+            }
+        ]
+    )
+    print(response)
+
+def verify_hostname(hostname, next_token):
+    acm_config = Config(
+        region_name = 'us-east-1'
+    )
+    client = boto3.client('acm',config=acm_config)
+    if next_token:
+        response = client.list_certificates(
+            CertificateStatuses=[
+                'ISSUED',
+            ],
+            MaxItems=10,
+            NextToken=next_token
+        )        
+    else:
+        response = client.list_certificates(
+            CertificateStatuses=[
+                'ISSUED',
+            ],
+            MaxItems=10,
+        )
+    if hostname_exist(hostname, response['CertificateSummaryList']):
+        return True
+    else:
+        if "NextToken" in response:
+            if hostname_exist(hostname, response['CertificateSummaryList']):
+                return True
+            else:    
+                return verify_hostname(hostname,response['NextToken'])
+        else:
+            return False
+
+def hostname_exist(hostname, certificatesummarylist):
+    for cert in certificatesummarylist:
+        if hostname == cert['DomainName']:
+            print("Hostname found:"+cert['DomainName'])
+            return True
+    return False
